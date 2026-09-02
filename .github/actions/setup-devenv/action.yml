@@ -1,0 +1,20 @@
+name: Setup devenv
+description: Install Nix and devenv with the devenv binary cache
+
+inputs:
+  github-token:
+    description: GitHub token used by Nix when fetching flake inputs
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: cachix/install-nix-action@v31
+      with:
+        github_access_token: ${{ inputs.github-token }}
+    - uses: cachix/cachix-action@v17
+      with:
+        name: devenv
+    - name: Install devenv
+      shell: bash
+      run: nix profile add nixpkgs#devenv

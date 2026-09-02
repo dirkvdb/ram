@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_NAME: ${{ github.ref_type == 'tag' && github.ref_name || format('ci-{0}', github.run_id) }}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-apple:
+    name: Build Apple ARM64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-devenv
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: devenv tasks run release:build-apple --input "tag=$RELEASE_NAME"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-aarch64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-linux-windows:
+    name: Build Linux and Windows
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-devenv
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check publish eligibility
+        id: release
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [[ "$REF_TYPE" == "tag" && "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build release artifacts
+        run: devenv tasks run release:build-linux-windows --input "tag=$RELEASE_NAME"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-and-windows
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub release
+    if: needs.build-linux-windows.outputs.publish == 'true'
+    needs:
+      - build-apple
+      - build-linux-windows
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-devenv
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: devenv tasks run release:publish --input "tag=$RELEASE_NAME"

@@ -36,12 +36,12 @@ fn zram_info() -> Zram {
                 .configured
                 .saturating_add(parse_single_u64(&text).unwrap_or(0));
         }
-        if let Ok(text) = fs::read_to_string(dir.join("mm_stat")) {
-            if let Some(stats) = parse_zram_mm_stat(&text) {
-                result.data = result.data.saturating_add(stats.data);
-                result.compressed = result.compressed.saturating_add(stats.compressed);
-                result.memory_used = result.memory_used.saturating_add(stats.memory_used);
-            }
+        if let Ok(text) = fs::read_to_string(dir.join("mm_stat"))
+            && let Some(stats) = parse_zram_mm_stat(&text)
+        {
+            result.data = result.data.saturating_add(stats.data);
+            result.compressed = result.compressed.saturating_add(stats.compressed);
+            result.memory_used = result.memory_used.saturating_add(stats.memory_used);
         }
     }
 

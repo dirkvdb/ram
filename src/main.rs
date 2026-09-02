@@ -8,19 +8,24 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("ram supports Linux and macOS only");
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("ram supports Linux, macOS, and Windows only");
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "linux")]
 use linux::collect;
 #[cfg(target_os = "macos")]
 use macos::collect;
+#[cfg(target_os = "windows")]
+use windows::collect;
 
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 const DEFAULT_PAGE_SIZE: u64 = 4096;
 #[cfg(any(test, target_os = "linux"))]
 const AT_PAGESZ: usize = 6;
@@ -81,6 +86,7 @@ struct ZramStats {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum PressureLevel {
     Normal,
     Warning,
@@ -122,6 +128,8 @@ enum PlatformDetails {
         compressor_uncompressed: u64,
         compressor_ram: u64,
     },
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Windows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,7 +371,7 @@ fn render_snapshot(
         format_bytes(memory.total)
     )?;
     match &snapshot.details {
-        PlatformDetails::Linux { .. } => {
+        PlatformDetails::Linux { .. } | PlatformDetails::Windows => {
             writeln!(
                 out,
                 "  Commit    {bold}{:>9}{reset} / {bold}{:>9}{reset}   {dim}({} of commit limit){reset}",
@@ -389,24 +397,28 @@ fn render_snapshot(
     let cache_note = match snapshot.details {
         PlatformDetails::Linux { .. } => "reclaimable on demand",
         PlatformDetails::Macos { .. } => "file-backed, reclaimable",
+        PlatformDetails::Windows => "Windows system cache",
     };
     writeln!(
         out,
         "  Cached    {bold}{:>9}{reset}               {dim}({cache_note}){reset}",
         format_bytes(memory.cache())
     )?;
-    let swap_note = match &snapshot.details {
-        PlatformDetails::Linux { zram } if zram.configured > 0 => {
-            "zram may be compressed; CPU, not disk"
-        }
-        PlatformDetails::Linux { .. } | PlatformDetails::Macos { .. } => "disk-backed swap",
-    };
-    writeln!(
-        out,
-        "  Swap      {bold}{:>9}{reset} / {bold}{:>9}{reset}   {dim}({swap_note}){reset}",
-        format_bytes(memory.swap_used()),
-        format_bytes(memory.swap_total)
-    )?;
+    if !matches!(snapshot.details, PlatformDetails::Windows) {
+        let swap_note = match &snapshot.details {
+            PlatformDetails::Linux { zram } if zram.configured > 0 => {
+                "zram may be compressed; CPU, not disk"
+            }
+            PlatformDetails::Linux { .. } | PlatformDetails::Macos { .. } => "disk-backed swap",
+            PlatformDetails::Windows => unreachable!(),
+        };
+        writeln!(
+            out,
+            "  Swap      {bold}{:>9}{reset} / {bold}{:>9}{reset}   {dim}({swap_note}){reset}",
+            format_bytes(memory.swap_used()),
+            format_bytes(memory.swap_total)
+        )?;
+    }
     match &snapshot.details {
         PlatformDetails::Linux { zram } if zram.data > 0 || zram.memory_used > 0 => {
             writeln!(
@@ -435,6 +447,7 @@ fn render_snapshot(
     let process_metric = match snapshot.details {
         PlatformDetails::Linux { .. } => "RESIDENT SET",
         PlatformDetails::Macos { .. } => "MEMORY",
+        PlatformDetails::Windows => "WORKING SET",
     };
     writeln!(
         out,
@@ -632,7 +645,7 @@ fn parse_count(value: &str) -> Result<usize, String> {
 fn print_help(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
-        "ram {}\n\nLinux and macOS memory overview\n\nUSAGE:\n    ram [OPTIONS]\n\nOPTIONS:\n    -n <COUNT>            Show this many process entries [default: 10]\n    --no-color            Disable ANSI colors\n    --no-prettify         Keep executable names exactly as reported\n    --watch <SECONDS>     Refresh repeatedly\n    --interval <SECONDS>  Alias for --watch\n    -h, --help            Print help\n    -V, --version         Print version",
+        "ram {}\n\nLinux, macOS, and Windows memory overview\n\nUSAGE:\n    ram [OPTIONS]\n\nOPTIONS:\n    -n <COUNT>            Show this many process entries [default: 10]\n    --no-color            Disable ANSI colors\n    --no-prettify         Keep executable names exactly as reported\n    --watch <SECONDS>     Refresh repeatedly\n    --interval <SECONDS>  Alias for --watch\n    -h, --help            Print help\n    -V, --version         Print version",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -651,10 +664,12 @@ fn run() -> io::Result<()> {
     };
 
     let terminal = io::stdout().is_terminal();
-    let color = !options.no_color
-        && terminal
-        && env::var("NO_COLOR").is_err()
-        && env::var("TERM").is_ok_and(|value| value != "dumb");
+    #[cfg(target_os = "windows")]
+    let terminal_supports_color = windows::enable_virtual_terminal_processing();
+    #[cfg(not(target_os = "windows"))]
+    let terminal_supports_color = env::var("TERM").is_ok_and(|value| value != "dumb");
+    let color =
+        !options.no_color && terminal && terminal_supports_color && env::var("NO_COLOR").is_err();
 
     loop {
         if options.watch_seconds.is_some() && terminal {
@@ -842,6 +857,40 @@ mod tests {
         assert!(!output.contains("Commit"));
         assert!(!output.contains("Zram"));
         assert!(!output.contains("RESIDENT SET"));
+        assert!(!output.contains("\x1b["));
+    }
+
+    #[test]
+    fn windows_snapshot_uses_commit_cache_and_working_sets() {
+        let snapshot = Snapshot {
+            hostname: "desktop".to_string(),
+            memory: Memory {
+                total: 32 * 1024 * 1024 * 1024,
+                available: 12 * 1024 * 1024 * 1024,
+                cached: 8 * 1024 * 1024 * 1024,
+                committed: 24 * 1024 * 1024 * 1024,
+                commit_limit: 48 * 1024 * 1024 * 1024,
+                ..Memory::default()
+            },
+            details: PlatformDetails::Windows,
+            groups: vec![ProcessGroup {
+                name: "browser.exe".to_string(),
+                count: 8,
+                rss: 3 * 1024 * 1024 * 1024,
+            }],
+        };
+        let mut output = Vec::new();
+        render_snapshot(&mut output, false, DEFAULT_PROCESS_COUNT, &snapshot).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("Commit"));
+        assert!(output.contains("Windows system cache"));
+        assert!(output.contains("TOP 10 PROCESSES BY WORKING SET"));
+        assert!(output.contains("browser.exe (8)"));
+        assert!(!output.contains("Swap"));
+        assert!(!output.contains("Pressure"));
+        assert!(!output.contains("Zram"));
+        assert!(!output.contains("Compress"));
         assert!(!output.contains("\x1b["));
     }
 

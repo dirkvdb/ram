@@ -7,15 +7,13 @@
   sizes use physical footprint (Activity Monitor's Memory column). There is no
   Linux-style commit limit, so the dashboard shows memory pressure and the
   in-RAM compressor instead of commit/zram.
+- **Windows** reads `GlobalMemoryStatusEx`, `GetPerformanceInfo`, and PSAPI.
+  Process sizes use each process working set. The dashboard shows Windows'
+  commit limit and system cache
 
 ### Usage
 
 ```text
-$ ram --help
-ram 0.1.0
-
-Linux and macOS memory overview
-
 USAGE:
     ram [OPTIONS]
 
@@ -28,6 +26,7 @@ OPTIONS:
     -h, --help            Print help
     -V, --version         Print version
 ```
+
 
 ### Example output (Linux)
 
@@ -84,4 +83,14 @@ Slack Helper (5)                880 M  ██████░░░░░░░�
 Codex (Service) (5)             783 M  █████░░░░░░░░░░░░░░░░░░░░░░   2.1%
 ──────────────────────────────────────────────────────────────────────────────
 These 10 account for     17.9 G  (49.7% of installed RAM)
+```
+
+### Building
+
+The devenv includes native, static musl Linux, and Windows release build commands:
+
+```text
+devenv shell -- ram-build
+devenv shell -- ram-build-linux-static
+devenv shell -- ram-build-windows
 ```

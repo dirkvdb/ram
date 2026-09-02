@@ -1,5 +1,5 @@
 {
-  description = "A small Linux and macOS memory overview CLI";
+  description = "A small Linux, macOS, and Windows memory overview CLI";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -26,10 +26,11 @@
           strictDeps = true;
 
           meta = {
-            description = "A small Linux and macOS memory overview CLI";
+            description = "A small Linux, macOS, and Windows memory overview CLI";
             license = pkgs.lib.licenses.mit;
             mainProgram = "ram";
-            platforms = pkgs.lib.platforms.linux ++ pkgs.lib.platforms.darwin;
+            platforms =
+              pkgs.lib.platforms.linux ++ pkgs.lib.platforms.darwin ++ pkgs.lib.platforms.windows;
           };
         };
     in
@@ -54,7 +55,7 @@
         ram = {
           type = "app";
           program = nixpkgs.lib.getExe self.packages.${system}.ram;
-          meta.description = "Show an overview of Linux or macOS memory usage";
+          meta.description = "Show an overview of Linux, macOS, or Windows memory usage";
         };
         default = self.apps.${system}.ram;
       });
