@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
     io::{self, IsTerminal, Write},
     path::Path,
     process::ExitCode,
@@ -8,7 +8,21 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("ram supports Linux and macOS only");
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(target_os = "linux")]
+use linux::collect;
+#[cfg(target_os = "macos")]
+use macos::collect;
+
 const DEFAULT_PAGE_SIZE: u64 = 4096;
+#[cfg(any(test, target_os = "linux"))]
 const AT_PAGESZ: usize = 6;
 const DEFAULT_PROCESS_COUNT: usize = 10;
 
@@ -58,11 +72,64 @@ struct Zram {
     memory_used: u64,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ZramStats {
     data: u64,
     compressed: u64,
     memory_used: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PressureLevel {
+    Normal,
+    Warning,
+    Urgent,
+    Critical,
+    Unknown(i32),
+}
+
+impl PressureLevel {
+    #[cfg(any(test, target_os = "macos"))]
+    fn from_sysctl(value: i32) -> Self {
+        match value {
+            0 | 1 => Self::Normal,
+            2 => Self::Warning,
+            3 => Self::Urgent,
+            4 => Self::Critical,
+            other => Self::Unknown(other),
+        }
+    }
+
+    fn as_str(self) -> String {
+        match self {
+            Self::Normal => "normal".to_string(),
+            Self::Warning => "warning".to_string(),
+            Self::Urgent => "urgent".to_string(),
+            Self::Critical => "critical".to_string(),
+            Self::Unknown(level) => format!("level {level}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlatformDetails {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Linux { zram: Zram },
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Macos {
+        pressure: PressureLevel,
+        compressor_uncompressed: u64,
+        compressor_ram: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    hostname: String,
+    memory: Memory,
+    details: PlatformDetails,
+    groups: Vec<ProcessGroup>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,10 +157,7 @@ enum Command {
     Version,
 }
 
-fn meminfo() -> io::Result<Memory> {
-    fs::read_to_string("/proc/meminfo").map(|text| parse_meminfo(&text))
-}
-
+#[cfg(any(test, target_os = "linux"))]
 fn parse_meminfo(text: &str) -> Memory {
     let mut memory = Memory::default();
     let mut has_available = false;
@@ -141,40 +205,12 @@ fn parse_meminfo(text: &str) -> Memory {
     memory
 }
 
-fn zram_info() -> Zram {
-    let mut result = Zram::default();
-    let Ok(entries) = fs::read_dir("/sys/block") else {
-        return result;
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("zram") {
-            continue;
-        }
-
-        let dir = entry.path();
-        if let Ok(text) = fs::read_to_string(dir.join("disksize")) {
-            result.configured = result
-                .configured
-                .saturating_add(parse_single_u64(&text).unwrap_or(0));
-        }
-        if let Ok(text) = fs::read_to_string(dir.join("mm_stat")) {
-            if let Some(stats) = parse_zram_mm_stat(&text) {
-                result.data = result.data.saturating_add(stats.data);
-                result.compressed = result.compressed.saturating_add(stats.compressed);
-                result.memory_used = result.memory_used.saturating_add(stats.memory_used);
-            }
-        }
-    }
-
-    result
-}
-
+#[cfg(target_os = "linux")]
 fn parse_single_u64(text: &str) -> Option<u64> {
     text.split_whitespace().next()?.parse().ok()
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn parse_zram_mm_stat(text: &str) -> Option<ZramStats> {
     let mut values = text.split_whitespace().take(3).map(str::parse::<u64>);
     Some(ZramStats {
@@ -184,47 +220,7 @@ fn parse_zram_mm_stat(text: &str) -> Option<ZramStats> {
     })
 }
 
-fn process_groups(prettify: bool, process_count: usize) -> Vec<ProcessGroup> {
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    let page_size = page_size();
-    let mut groups: HashMap<String, (usize, u64)> = HashMap::new();
-
-    for entry in entries.flatten() {
-        let filename = entry.file_name();
-        if !filename.as_encoded_bytes().iter().all(u8::is_ascii_digit) {
-            continue;
-        }
-
-        let dir = entry.path();
-        let Some(rss) = fs::read_to_string(dir.join("statm"))
-            .ok()
-            .and_then(|text| parse_statm_rss(&text, page_size))
-        else {
-            continue;
-        };
-        if rss == 0 {
-            continue;
-        }
-
-        let Some(executable) = process_name(&dir, prettify) else {
-            continue;
-        };
-        let item = groups.entry(executable).or_insert((0, 0));
-        item.0 += 1;
-        item.1 = item.1.saturating_add(rss);
-    }
-
-    let mut groups: Vec<_> = groups
-        .into_iter()
-        .map(|(name, (count, rss))| ProcessGroup { name, count, rss })
-        .collect();
-    groups.sort_by(|a, b| b.rss.cmp(&a.rss).then_with(|| a.name.cmp(&b.name)));
-    groups.truncate(process_count);
-    groups
-}
-
+#[cfg(any(test, target_os = "linux"))]
 fn parse_statm_rss(text: &str, page_size: u64) -> Option<u64> {
     text.split_whitespace()
         .nth(1)?
@@ -233,35 +229,17 @@ fn parse_statm_rss(text: &str, page_size: u64) -> Option<u64> {
         .map(|pages| pages.saturating_mul(page_size))
 }
 
-fn process_name(dir: &Path, prettify: bool) -> Option<String> {
-    if let Ok(target) = fs::read_link(dir.join("exe")) {
-        let name = target.file_name().unwrap_or(target.as_os_str());
-        let name = name.to_string_lossy();
-        let name = name.strip_suffix(" (deleted)").unwrap_or(&name);
-        if !name.is_empty() {
-            return Some(if prettify {
-                clean_executable_name(&target, name)
-            } else {
-                sanitize_name(name)
-            });
-        }
-    }
-
-    if let Ok(comm) = fs::read(dir.join("comm")) {
-        let comm = trim_ascii_whitespace(&comm);
-        if !comm.is_empty() {
-            return Some(sanitize_name(&String::from_utf8_lossy(comm)));
-        }
-    }
-
-    let command_line = fs::read(dir.join("cmdline")).ok()?;
-    let first = command_line.split(|byte| *byte == 0).next()?;
-    let name = first.rsplit(|byte| *byte == b'/').next()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(sanitize_name(&String::from_utf8_lossy(name)))
-    }
+fn rank_process_groups(
+    groups: HashMap<String, (usize, u64)>,
+    process_count: usize,
+) -> Vec<ProcessGroup> {
+    let mut groups: Vec<_> = groups
+        .into_iter()
+        .map(|(name, (count, rss))| ProcessGroup { name, count, rss })
+        .collect();
+    groups.sort_by(|a, b| b.rss.cmp(&a.rss).then_with(|| a.name.cmp(&b.name)));
+    groups.truncate(process_count);
+    groups
 }
 
 fn clean_executable_name(path: &Path, name: &str) -> String {
@@ -281,6 +259,7 @@ fn clean_executable_name(path: &Path, name: &str) -> String {
     sanitize_name(cleaned)
 }
 
+#[cfg(target_os = "linux")]
 fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
     while bytes.first().is_some_and(u8::is_ascii_whitespace) {
         bytes = &bytes[1..];
@@ -303,13 +282,7 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
-fn page_size() -> u64 {
-    fs::read("/proc/self/auxv")
-        .ok()
-        .and_then(|bytes| parse_auxv_page_size(&bytes))
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-}
-
+#[cfg(any(test, target_os = "linux"))]
 fn parse_auxv_page_size(bytes: &[u8]) -> Option<u64> {
     let word_size = std::mem::size_of::<usize>();
     for entry in bytes.chunks_exact(word_size * 2) {
@@ -348,31 +321,30 @@ fn render(
     prettify: bool,
     process_count: usize,
 ) -> io::Result<()> {
-    let memory = meminfo()?;
-    let zram = zram_info();
-    let groups = process_groups(prettify, process_count);
-    render_snapshot(out, color, process_count, &memory, &zram, &groups)
+    let snapshot = collect(prettify, process_count)?;
+    render_snapshot(out, color, process_count, &snapshot)
 }
 
 fn render_snapshot(
     out: &mut impl Write,
     color: bool,
     process_count: usize,
-    memory: &Memory,
-    zram: &Zram,
-    groups: &[ProcessGroup],
+    snapshot: &Snapshot,
 ) -> io::Result<()> {
     // Standard ANSI palette roles are resolved by the active terminal theme.
-    let (accent, positive, dim, bold, reset) = if color {
-        ("\x1b[36m", "\x1b[32m", "\x1b[2m", "\x1b[1m", "\x1b[0m")
+    let (accent, positive, warning, critical, dim, bold, reset) = if color {
+        (
+            "\x1b[36m", "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[2m", "\x1b[1m", "\x1b[0m",
+        )
     } else {
-        ("", "", "", "", "")
+        ("", "", "", "", "", "", "")
     };
 
-    let hostname = hostname();
+    let memory = &snapshot.memory;
     writeln!(
         out,
-        "{accent}{bold}RAM USAGE{reset}  {dim}—{reset}  {bold}{hostname}{reset}  {dim}{}{reset}",
+        "{accent}{bold}RAM USAGE{reset}  {dim}—{reset}  {bold}{}{reset}  {dim}{}{reset}",
+        snapshot.hostname,
         utc_clock()
     )?;
     writeln!(out, "{dim}{}{reset}", "─".repeat(78))?;
@@ -390,22 +362,44 @@ fn render_snapshot(
         format_bytes(memory.available),
         format_bytes(memory.total)
     )?;
+    match &snapshot.details {
+        PlatformDetails::Linux { .. } => {
+            writeln!(
+                out,
+                "  Commit    {bold}{:>9}{reset} / {bold}{:>9}{reset}   {dim}({} of commit limit){reset}",
+                format_bytes(memory.committed),
+                format_bytes(memory.commit_limit),
+                format_percent(memory.committed, memory.commit_limit)
+            )?;
+        }
+        PlatformDetails::Macos { pressure, .. } => {
+            let pressure_color = match pressure {
+                PressureLevel::Normal => positive,
+                PressureLevel::Warning => warning,
+                PressureLevel::Urgent | PressureLevel::Critical => critical,
+                PressureLevel::Unknown(_) => dim,
+            };
+            writeln!(
+                out,
+                "  Pressure  {pressure_color}{bold}{:>9}{reset}               {dim}(macOS memory pressure){reset}",
+                pressure.as_str()
+            )?;
+        }
+    }
+    let cache_note = match snapshot.details {
+        PlatformDetails::Linux { .. } => "reclaimable on demand",
+        PlatformDetails::Macos { .. } => "file-backed, reclaimable",
+    };
     writeln!(
         out,
-        "  Commit    {bold}{:>9}{reset} / {bold}{:>9}{reset}   {dim}({} of commit limit){reset}",
-        format_bytes(memory.committed),
-        format_bytes(memory.commit_limit),
-        format_percent(memory.committed, memory.commit_limit)
-    )?;
-    writeln!(
-        out,
-        "  Cached    {bold}{:>9}{reset}               {dim}(reclaimable on demand){reset}",
+        "  Cached    {bold}{:>9}{reset}               {dim}({cache_note}){reset}",
         format_bytes(memory.cache())
     )?;
-    let swap_note = if zram.configured > 0 {
-        "zram may be compressed; CPU, not disk"
-    } else {
-        "disk-backed swap"
+    let swap_note = match &snapshot.details {
+        PlatformDetails::Linux { zram } if zram.configured > 0 => {
+            "zram may be compressed; CPU, not disk"
+        }
+        PlatformDetails::Linux { .. } | PlatformDetails::Macos { .. } => "disk-backed swap",
     };
     writeln!(
         out,
@@ -413,24 +407,43 @@ fn render_snapshot(
         format_bytes(memory.swap_used()),
         format_bytes(memory.swap_total)
     )?;
-    if zram.data > 0 || zram.memory_used > 0 {
-        writeln!(
-            out,
-            "  Zram      {bold}{:>9}{reset} data, {bold}{:>9}{reset} compressed, {bold}{:>9}{reset} RAM",
-            format_bytes(zram.data),
-            format_bytes(zram.compressed),
-            format_bytes(zram.memory_used)
-        )?;
+    match &snapshot.details {
+        PlatformDetails::Linux { zram } if zram.data > 0 || zram.memory_used > 0 => {
+            writeln!(
+                out,
+                "  Zram      {bold}{:>9}{reset} data, {bold}{:>9}{reset} compressed, {bold}{:>9}{reset} RAM",
+                format_bytes(zram.data),
+                format_bytes(zram.compressed),
+                format_bytes(zram.memory_used)
+            )?;
+        }
+        PlatformDetails::Macos {
+            compressor_uncompressed,
+            compressor_ram,
+            ..
+        } if *compressor_uncompressed > 0 || *compressor_ram > 0 => {
+            writeln!(
+                out,
+                "  Compress  {bold}{:>9}{reset} stored, {bold}{:>9}{reset} in RAM   {dim}(in-memory compressor){reset}",
+                format_bytes(*compressor_uncompressed),
+                format_bytes(*compressor_ram)
+            )?;
+        }
+        _ => {}
     }
 
+    let process_metric = match snapshot.details {
+        PlatformDetails::Linux { .. } => "RESIDENT SET",
+        PlatformDetails::Macos { .. } => "MEMORY",
+    };
     writeln!(
         out,
-        "\n{accent}{bold}TOP {process_count} PROCESSES BY RESIDENT SET{reset}"
+        "\n{accent}{bold}TOP {process_count} PROCESSES BY {process_metric}{reset}"
     )?;
     writeln!(out, "{dim}{}{reset}", "─".repeat(78))?;
 
-    let largest_rss = groups.first().map_or(0, |process| process.rss);
-    for process in groups {
+    let largest_rss = snapshot.groups.first().map_or(0, |process| process.rss);
+    for process in &snapshot.groups {
         let label = if process.count > 1 {
             format!("{} ({})", process.name, process.count)
         } else {
@@ -445,14 +458,15 @@ fn render_snapshot(
             format_percent(process.rss, memory.total)
         )?;
     }
-    let top_rss = groups
+    let top_rss = snapshot
+        .groups
         .iter()
         .fold(0_u64, |total, process| total.saturating_add(process.rss));
     writeln!(out, "{dim}{}{reset}", "─".repeat(78))?;
     writeln!(
         out,
         "{dim}These {} account for{reset}  {bold}{:>9}{reset}  {dim}({} of installed RAM){reset}",
-        groups.len(),
+        snapshot.groups.len(),
         format_bytes(top_rss),
         format_percent(top_rss, memory.total)
     )?;
@@ -486,15 +500,6 @@ fn format_percent(value: u64, total: u64) -> String {
     }
     let tenths = u128::from(value) * 1000 / u128::from(total);
     format!("{}.{:01}%", tenths / 10, tenths % 10)
-}
-
-fn hostname() -> String {
-    fs::read("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|bytes| trim_ascii_whitespace(&bytes).to_vec())
-        .filter(|bytes| !bytes.is_empty())
-        .map(|bytes| sanitize_name(&String::from_utf8_lossy(&bytes)))
-        .unwrap_or_else(|| "linux".to_string())
 }
 
 fn utc_clock() -> String {
@@ -627,7 +632,7 @@ fn parse_count(value: &str) -> Result<usize, String> {
 fn print_help(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
-        "ram {}\n\nLinux memory overview\n\nUSAGE:\n    ram [OPTIONS]\n\nOPTIONS:\n    -n <COUNT>            Show this many process entries [default: 10]\n    --no-color            Disable ANSI colors\n    --no-prettify         Keep executable names exactly as reported\n    --watch <SECONDS>     Refresh repeatedly\n    --interval <SECONDS>  Alias for --watch\n    -h, --help            Print help\n    -V, --version         Print version",
+        "ram {}\n\nLinux and macOS memory overview\n\nUSAGE:\n    ram [OPTIONS]\n\nOPTIONS:\n    -n <COUNT>            Show this many process entries [default: 10]\n    --no-color            Disable ANSI colors\n    --no-prettify         Keep executable names exactly as reported\n    --watch <SECONDS>     Refresh repeatedly\n    --interval <SECONDS>  Alias for --watch\n    -h, --help            Print help\n    -V, --version         Print version",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -770,36 +775,73 @@ mod tests {
 
     #[test]
     fn snapshot_matches_the_compact_dashboard_structure() {
-        let memory = Memory {
-            total: 8 * 1024 * 1024 * 1024,
-            available: 6 * 1024 * 1024 * 1024,
-            committed: 6 * 1024 * 1024 * 1024,
-            commit_limit: 10 * 1024 * 1024 * 1024,
-            ..Memory::default()
+        let snapshot = Snapshot {
+            hostname: "test-host".to_string(),
+            memory: Memory {
+                total: 8 * 1024 * 1024 * 1024,
+                available: 6 * 1024 * 1024 * 1024,
+                committed: 6 * 1024 * 1024 * 1024,
+                commit_limit: 10 * 1024 * 1024 * 1024,
+                ..Memory::default()
+            },
+            details: PlatformDetails::Linux {
+                zram: Zram::default(),
+            },
+            groups: vec![ProcessGroup {
+                name: "browser".to_string(),
+                count: 3,
+                rss: 1024 * 1024 * 1024,
+            }],
         };
-        let groups = vec![ProcessGroup {
-            name: "browser".to_string(),
-            count: 3,
-            rss: 1024 * 1024 * 1024,
-        }];
         let mut output = Vec::new();
-        render_snapshot(
-            &mut output,
-            false,
-            DEFAULT_PROCESS_COUNT,
-            &memory,
-            &Zram::default(),
-            &groups,
-        )
-        .unwrap();
+        render_snapshot(&mut output, false, DEFAULT_PROCESS_COUNT, &snapshot).unwrap();
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.contains("RAM USAGE"));
         assert!(output.contains("Used"));
         assert!(output.contains("Available"));
+        assert!(output.contains("Commit"));
         assert!(output.contains("TOP 10 PROCESSES BY RESIDENT SET"));
         assert!(output.contains("browser (3)"));
         assert!(output.contains("These 1 account for"));
+        assert!(!output.contains("\x1b["));
+        assert!(!output.contains("Pressure"));
+    }
+
+    #[test]
+    fn macos_snapshot_uses_pressure_and_compressor() {
+        let snapshot = Snapshot {
+            hostname: "macbook".to_string(),
+            memory: Memory {
+                total: 36 * 1024 * 1024 * 1024,
+                available: 8 * 1024 * 1024 * 1024,
+                cached: 5 * 1024 * 1024 * 1024,
+                ..Memory::default()
+            },
+            details: PlatformDetails::Macos {
+                pressure: PressureLevel::Warning,
+                compressor_uncompressed: 24 * 1024 * 1024 * 1024,
+                compressor_ram: 11 * 1024 * 1024 * 1024,
+            },
+            groups: vec![ProcessGroup {
+                name: "Cursor".to_string(),
+                count: 12,
+                rss: 2 * 1024 * 1024 * 1024,
+            }],
+        };
+        let mut output = Vec::new();
+        render_snapshot(&mut output, false, DEFAULT_PROCESS_COUNT, &snapshot).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("Pressure"));
+        assert!(output.contains("warning"));
+        assert!(output.contains("Compress"));
+        assert!(output.contains("file-backed, reclaimable"));
+        assert!(output.contains("TOP 10 PROCESSES BY MEMORY"));
+        assert!(output.contains("Cursor (12)"));
+        assert!(!output.contains("Commit"));
+        assert!(!output.contains("Zram"));
+        assert!(!output.contains("RESIDENT SET"));
         assert!(!output.contains("\x1b["));
     }
 
@@ -848,6 +890,13 @@ mod tests {
             clean_executable_name(Path::new("/nix/store/hash-app/bin/ordinary"), "ordinary"),
             "ordinary"
         );
+        assert_eq!(
+            clean_executable_name(
+                Path::new("/Applications/Safari.app/Contents/MacOS/Safari"),
+                "Safari"
+            ),
+            "Safari"
+        );
     }
 
     #[test]
@@ -869,5 +918,13 @@ mod tests {
         assert!(parse_args(["-n".to_string()]).is_err());
         assert!(parse_args(["--watch".to_string(), "0".to_string()]).is_err());
         assert!(parse_args(["--unknown".to_string()]).is_err());
+    }
+
+    #[test]
+    fn memory_pressure_maps_xnu_levels() {
+        assert_eq!(PressureLevel::from_sysctl(1), PressureLevel::Normal);
+        assert_eq!(PressureLevel::from_sysctl(2), PressureLevel::Warning);
+        assert_eq!(PressureLevel::from_sysctl(4), PressureLevel::Critical);
+        assert_eq!(PressureLevel::from_sysctl(9), PressureLevel::Unknown(9));
     }
 }

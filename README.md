@@ -1,6 +1,12 @@
 # ram
 
-`ram` is a small Linux-only memory overview CLI written entirely in Rust. It reads `/proc` and `/sys` directly
+`ram` is a small memory overview CLI written entirely in Rust.
+
+- **Linux** reads `/proc` and `/sys` directly.
+- **macOS** reads Mach (`host_statistics64`), `sysctl`, and `libproc`. Process
+  sizes use physical footprint (Activity Monitor's Memory column). There is no
+  Linux-style commit limit, so the dashboard shows memory pressure and the
+  in-RAM compressor instead of commit/zram.
 
 ### Usage
 
@@ -8,7 +14,7 @@
 $ ram --help
 ram 0.1.0
 
-Linux memory overview
+Linux and macOS memory overview
 
 USAGE:
     ram [OPTIONS]
@@ -23,7 +29,7 @@ OPTIONS:
     -V, --version         Print version
 ```
 
-### Example output
+### Example output (Linux)
 
 ```text
 RAM USAGE  —  p260182  Wed 14:28:30 UTC
@@ -49,4 +55,33 @@ DesktopEditors                  266 M  ░░░░░░░░░░░░░�
 fastpotify                      239 M  ░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.3%
 ──────────────────────────────────────────────────────────────────────────────
 These 10 account for     15.0 G  (24.0% of installed RAM)
+```
+
+### Example output (macOS)
+
+```text
+RAM USAGE  —  macbook-robin.local  Wed 14:52:02 UTC
+──────────────────────────────────────────────────────────────────────────────
+[██████████████████████████████████████████████████████░░░░░░░░░░░░░]  81.6%
+
+  Used         29.4 G    Available     6.59 G    Total     36.0 G
+  Pressure     normal               (macOS memory pressure)
+  Cached       5.05 G               (file-backed, reclaimable)
+  Swap            0 B /       0 B   (disk-backed swap)
+  Compress     23.5 G stored,    11.1 G in RAM   (in-memory compressor)
+
+TOP 10 PROCESSES BY MEMORY
+──────────────────────────────────────────────────────────────────────────────
+qemu-system-aarch64            3.63 G  ███████████████████████████  10.0%
+Cursor Helper (Renderer) (…    2.67 G  ███████████████████░░░░░░░░   7.4%
+Browser Helper (Renderer) …    2.59 G  ███████████████████░░░░░░░░   7.1%
+Cursor Helper (Plugin) (24)    2.32 G  █████████████████░░░░░░░░░░   6.4%
+Cursor Helper (13)             1.90 G  ██████████████░░░░░░░░░░░░░   5.2%
+MTLCompilerService (64)        1.09 G  ████████░░░░░░░░░░░░░░░░░░░   3.0%
+Microsoft Teams WebView He…    1.07 G  ███████░░░░░░░░░░░░░░░░░░░░   2.9%
+Arc                            1.00 G  ███████░░░░░░░░░░░░░░░░░░░░   2.7%
+Slack Helper (5)                880 M  ██████░░░░░░░░░░░░░░░░░░░░░   2.3%
+Codex (Service) (5)             783 M  █████░░░░░░░░░░░░░░░░░░░░░░   2.1%
+──────────────────────────────────────────────────────────────────────────────
+These 10 account for     17.9 G  (49.7% of installed RAM)
 ```
