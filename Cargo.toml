@@ -1,0 +1,10 @@
+[package]
+name = "ram"
+version = "0.1.0"
+edition = "2024"
+description = "A small Linux memory overview CLI"
+license = "MIT"
+
+[profile.release]
+lto = true
+codegen-units = 1
