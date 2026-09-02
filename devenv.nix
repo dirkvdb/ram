@@ -9,6 +9,7 @@ let
       (pkgs.callPackage "${pkgs.path}/pkgs/applications/emulators/wine/llvm-mingw.nix" { }).overrideAttrs
         (old: {
           buildInputs = (old.buildInputs or [ ]) ++ [ pkgs.zstd ];
+          # The prebuilt x86_64 archive's LLDB needs libraries that cross-linking does not use.
           postInstall = (old.postInstall or "") + ''
             rm -f "$out"/bin/lldb* "$out"/lib/liblldb*
           '';
