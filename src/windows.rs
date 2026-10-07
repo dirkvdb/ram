@@ -112,7 +112,11 @@ impl Drop for OwnedHandle {
     }
 }
 
-pub(crate) fn collect(prettify: bool, process_count: usize) -> io::Result<Snapshot> {
+pub(crate) fn collect(
+    prettify: bool,
+    process_count: usize,
+    filters: &[String],
+) -> io::Result<Snapshot> {
     let status = memory_status()?;
     let performance = performance_info()?;
     let page_size = performance.page_size as u64;
@@ -128,7 +132,7 @@ pub(crate) fn collect(prettify: bool, process_count: usize) -> io::Result<Snapsh
             ..Memory::default()
         },
         details: PlatformDetails::Windows,
-        groups: process_groups(prettify, process_count),
+        groups: process_groups(prettify, process_count, filters),
     })
 }
 
@@ -158,7 +162,7 @@ fn performance_info() -> io::Result<PerformanceInformation> {
     }
 }
 
-fn process_groups(prettify: bool, process_count: usize) -> Vec<ProcessGroup> {
+fn process_groups(prettify: bool, process_count: usize, filters: &[String]) -> Vec<ProcessGroup> {
     let mut groups: HashMap<String, (usize, u64)> = HashMap::new();
 
     for pid in pids() {
@@ -179,7 +183,7 @@ fn process_groups(prettify: bool, process_count: usize) -> Vec<ProcessGroup> {
         item.1 = item.1.saturating_add(rss);
     }
 
-    rank_process_groups(groups, process_count)
+    rank_process_groups(groups, process_count, filters)
 }
 
 fn pids() -> Vec<Dword> {

@@ -110,7 +110,11 @@ unsafe extern "C" {
     fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut c_void) -> c_int;
 }
 
-pub(crate) fn collect(prettify: bool, process_count: usize) -> io::Result<Snapshot> {
+pub(crate) fn collect(
+    prettify: bool,
+    process_count: usize,
+    filters: &[String],
+) -> io::Result<Snapshot> {
     let page_size = page_size();
     let total = sysctl::<u64>("hw.memsize")?;
     let vm = vm_statistics()?;
@@ -147,7 +151,7 @@ pub(crate) fn collect(prettify: bool, process_count: usize) -> io::Result<Snapsh
             compressor_uncompressed,
             compressor_ram,
         },
-        groups: process_groups(prettify, process_count),
+        groups: process_groups(prettify, process_count, filters),
     })
 }
 
@@ -172,7 +176,7 @@ fn vm_statistics() -> io::Result<VmStatistics64> {
     Ok(info)
 }
 
-fn process_groups(prettify: bool, process_count: usize) -> Vec<ProcessGroup> {
+fn process_groups(prettify: bool, process_count: usize, filters: &[String]) -> Vec<ProcessGroup> {
     let mut groups: HashMap<String, (usize, u64)> = HashMap::new();
 
     for pid in pids() {
@@ -190,7 +194,7 @@ fn process_groups(prettify: bool, process_count: usize) -> Vec<ProcessGroup> {
         item.1 = item.1.saturating_add(rss);
     }
 
-    rank_process_groups(groups, process_count)
+    rank_process_groups(groups, process_count, filters)
 }
 
 fn pids() -> Vec<i32> {
@@ -366,7 +370,7 @@ mod tests {
 
     #[test]
     fn live_snapshot_has_installed_ram() {
-        let snapshot = collect(true, 5).unwrap();
+        let snapshot = collect(true, 5, &[]).unwrap();
         assert!(snapshot.memory.total >= 512 * 1024 * 1024);
         assert!(snapshot.memory.used() <= snapshot.memory.total);
         assert!(matches!(snapshot.details, PlatformDetails::Macos { .. }));

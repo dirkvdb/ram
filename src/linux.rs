@@ -5,12 +5,16 @@ use crate::{
     parse_single_u64, parse_statm_rss, parse_zram_mm_stat, rank_process_groups,
 };
 
-pub(crate) fn collect(prettify: bool, process_count: usize) -> io::Result<Snapshot> {
+pub(crate) fn collect(
+    prettify: bool,
+    process_count: usize,
+    filters: &[String],
+) -> io::Result<Snapshot> {
     Ok(Snapshot {
         hostname: hostname(),
         memory: meminfo()?,
         details: PlatformDetails::Linux { zram: zram_info() },
-        groups: process_groups(prettify, process_count),
+        groups: process_groups(prettify, process_count, filters),
     })
 }
 
@@ -48,7 +52,7 @@ fn zram_info() -> Zram {
     result
 }
 
-fn process_groups(prettify: bool, process_count: usize) -> Vec<ProcessGroup> {
+fn process_groups(prettify: bool, process_count: usize, filters: &[String]) -> Vec<ProcessGroup> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -80,7 +84,7 @@ fn process_groups(prettify: bool, process_count: usize) -> Vec<ProcessGroup> {
         item.1 = item.1.saturating_add(rss);
     }
 
-    rank_process_groups(groups, process_count)
+    rank_process_groups(groups, process_count, filters)
 }
 
 fn process_name(dir: &Path, prettify: bool) -> Option<String> {

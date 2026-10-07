@@ -19,6 +19,7 @@ USAGE:
 
 OPTIONS:
     -n <COUNT>            Show this many process entries [default: 10]
+    -f, --filter <TEXT>   Match process names (substring, ignore case; repeat for OR)
     --no-color            Disable ANSI colors
     --no-prettify         Keep executable names exactly as reported
     --watch <SECONDS>     Refresh repeatedly
@@ -26,6 +27,14 @@ OPTIONS:
     -h, --help            Print help
     -V, --version         Print version
 ```
+
+Use `ram --filter firefox` (or `ram -f firefox`) to show only process groups
+whose displayed names contain `firefox`, ignoring case. `--filter=firefox` is
+also supported. Filtering happens before the `-n` limit and applies on every
+refresh in watch mode. Repeat the argument to match any filter, for example
+`ram -f firefox -f slack` includes Firefox or Slack process groups.
+An empty filter includes all processes. With
+`--no-prettify`, the filter matches the original executable names.
 
 
 ### Example output (Linux)

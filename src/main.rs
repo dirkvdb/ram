@@ -140,12 +140,13 @@ struct Snapshot {
     groups: Vec<ProcessGroup>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Options {
     no_color: bool,
     no_prettify: bool,
     watch_seconds: Option<u64>,
     process_count: usize,
+    filters: Vec<String>,
 }
 
 impl Default for Options {
@@ -155,6 +156,7 @@ impl Default for Options {
             no_prettify: false,
             watch_seconds: None,
             process_count: DEFAULT_PROCESS_COUNT,
+            filters: Vec::new(),
         }
     }
 }
@@ -240,9 +242,17 @@ fn parse_statm_rss(text: &str, page_size: u64) -> Option<u64> {
 fn rank_process_groups(
     groups: HashMap<String, (usize, u64)>,
     process_count: usize,
+    filters: &[String],
 ) -> Vec<ProcessGroup> {
+    let filters: Vec<_> = filters.iter().map(|filter| filter.to_lowercase()).collect();
     let mut groups: Vec<_> = groups
         .into_iter()
+        .filter(|(name, _)| {
+            filters.is_empty() || {
+                let name = name.to_lowercase();
+                filters.iter().any(|filter| name.contains(filter))
+            }
+        })
         .map(|(name, (count, rss))| ProcessGroup { name, count, rss })
         .collect();
     groups.sort_by(|a, b| b.rss.cmp(&a.rss).then_with(|| a.name.cmp(&b.name)));
@@ -328,8 +338,9 @@ fn render(
     color: bool,
     prettify: bool,
     process_count: usize,
+    filters: &[String],
 ) -> io::Result<()> {
-    let snapshot = collect(prettify, process_count)?;
+    let snapshot = collect(prettify, process_count, filters)?;
     render_snapshot(out, color, process_count, &snapshot)
 }
 
@@ -600,6 +611,15 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             "-V" | "--version" => return Ok(Command::Version),
             "--no-color" => options.no_color = true,
             "--no-prettify" => options.no_prettify = true,
+            "-f" | "--filter" => {
+                options.filters.push(
+                    args.next()
+                        .ok_or_else(|| format!("{argument} requires a process name filter"))?,
+                );
+            }
+            _ if argument.starts_with("--filter=") => {
+                options.filters.push(argument[9..].to_string());
+            }
             "-n" => {
                 let value = args
                     .next()
@@ -645,7 +665,7 @@ fn parse_count(value: &str) -> Result<usize, String> {
 fn print_help(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
-        "ram {}\n\nLinux, macOS, and Windows memory overview\n\nUSAGE:\n    ram [OPTIONS]\n\nOPTIONS:\n    -n <COUNT>            Show this many process entries [default: 10]\n    --no-color            Disable ANSI colors\n    --no-prettify         Keep executable names exactly as reported\n    --watch <SECONDS>     Refresh repeatedly\n    --interval <SECONDS>  Alias for --watch\n    -h, --help            Print help\n    -V, --version         Print version",
+        "ram {}\n\nLinux, macOS, and Windows memory overview\n\nUSAGE:\n    ram [OPTIONS]\n\nOPTIONS:\n    -n <COUNT>            Show this many process entries [default: 10]\n    -f, --filter <TEXT>   Match process names (substring, ignore case; repeat for OR)\n    --no-color            Disable ANSI colors\n    --no-prettify         Keep executable names exactly as reported\n    --watch <SECONDS>     Refresh repeatedly\n    --interval <SECONDS>  Alias for --watch\n    -h, --help            Print help\n    -V, --version         Print version",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -680,6 +700,7 @@ fn run() -> io::Result<()> {
             color,
             !options.no_prettify,
             options.process_count,
+            &options.filters,
         )?;
         stdout.flush()?;
         if let Some(seconds) = options.watch_seconds {
@@ -945,6 +966,91 @@ mod tests {
                 "Safari"
             ),
             "Safari"
+        );
+    }
+
+    #[test]
+    fn parses_process_filter_forms() {
+        for args in [
+            vec!["-f", "Firefox"],
+            vec!["--filter", "Firefox"],
+            vec!["--filter=Firefox"],
+        ] {
+            let Command::Run(options) = parse_args(args.into_iter().map(String::from)).unwrap()
+            else {
+                panic!("expected run command");
+            };
+            assert_eq!(options.filters, ["Firefox"]);
+        }
+        for flag in ["-f", "--filter"] {
+            assert!(parse_args([flag.to_string()]).is_err());
+        }
+        let Command::Run(options) = parse_args(["--filter=".to_string()]).unwrap() else {
+            panic!("expected run command");
+        };
+        assert_eq!(options.filters, [""]);
+        let Command::Run(options) = parse_args([]).unwrap() else {
+            panic!("expected run command");
+        };
+        assert!(options.filters.is_empty());
+        let Command::Run(options) = parse_args(
+            ["-f", "Firefox", "--filter", "Slack", "--filter=Code"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap() else {
+            panic!("expected run command");
+        };
+        assert_eq!(options.filters, ["Firefox", "Slack", "Code"]);
+    }
+
+    #[test]
+    fn filters_process_groups_before_limiting_results() {
+        let groups = HashMap::from([
+            ("unrelated".to_string(), (1, 1000)),
+            ("Firefox".to_string(), (3, 300)),
+            ("firefox-helper".to_string(), (2, 200)),
+            ("Firefox-worker".to_string(), (1, 200)),
+        ]);
+        let filtered = rank_process_groups(groups.clone(), 2, &["FIREFOX".to_string()]);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].name, "Firefox");
+        assert_eq!(filtered[0].count, 3);
+        assert_eq!(filtered[0].rss, 300);
+        assert_eq!(filtered[1].name, "Firefox-worker");
+        assert!(rank_process_groups(groups.clone(), 10, &["missing".to_string()]).is_empty());
+        assert_eq!(
+            rank_process_groups(groups.clone(), 10, &["missing".to_string(), "".to_string()]),
+            rank_process_groups(groups, 10, &[])
+        );
+    }
+
+    #[test]
+    fn repeated_filters_match_any_value_without_duplicate_groups() {
+        let groups = HashMap::from([
+            ("unrelated".to_string(), (1, 1000)),
+            ("Firefox".to_string(), (3, 300)),
+            ("Slack".to_string(), (2, 200)),
+        ]);
+        let filtered = rank_process_groups(
+            groups,
+            2,
+            &["FIRE".to_string(), "slack".to_string(), "fox".to_string()],
+        );
+        assert_eq!(
+            filtered,
+            vec![
+                ProcessGroup {
+                    name: "Firefox".to_string(),
+                    count: 3,
+                    rss: 300
+                },
+                ProcessGroup {
+                    name: "Slack".to_string(),
+                    count: 2,
+                    rss: 200
+                },
+            ]
         );
     }
 
